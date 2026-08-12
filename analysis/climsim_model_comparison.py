@@ -43,6 +43,13 @@ T_SLICE = slice(0, 60)      # state_t
 Q_SLICE = slice(60, 120)    # state_q0001
 SCALARS = slice(120, 124)   # ps, SOLIN, LHFLX, SHFLX
 
+# ---- ClimSim target variable groups (128 outputs) --------------------------
+TGT_GROUPS = {
+    "ptend_t  (0-59)":   slice(0, 60),     # temperature tendency
+    "ptend_q  (60-119)": slice(60, 120),   # moisture tendency
+    "surface  (120-127)": slice(120, 128), # 8 surface fluxes
+}
+
 
 def load_split(data_dir: str, n_rows: int, seed: int):
     """Return (X_train, y_train, X_val, y_val), row-subsampled for tractability."""
@@ -87,13 +94,26 @@ def add_rh_feature(X: np.ndarray) -> np.ndarray:
 
 
 def metrics(y_true, y_pred, cols=None):
-    """MAE, RMSE, mean-R2 over the given target columns (default: all)."""
+    """MAE, RMSE, and two aggregate R2 flavours over target columns (default all).
+
+    r2_unif : mean of per-column R2 (uniform_average). Dominated by low-variance
+              output channels -> can go strongly negative even when MAE is small.
+    r2_varw : variance-weighted R2. Weights each channel by its variance, so
+              near-zero-variance channels stop dominating -> the meaningful number.
+    """
     if cols is not None:
         y_true, y_pred = y_true[:, cols], y_pred[:, cols]
     mae = mean_absolute_error(y_true, y_pred)
     rmse = float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
-    r2 = r2_score(y_true, y_pred, multioutput="uniform_average")
-    return mae, rmse, r2
+    r2_unif = r2_score(y_true, y_pred, multioutput="uniform_average")
+    r2_varw = r2_score(y_true, y_pred, multioutput="variance_weighted")
+    return mae, rmse, r2_unif, r2_varw
+
+
+def group_r2(y_true, y_pred):
+    """Variance-weighted R2 within each ClimSim target group."""
+    return {g: r2_score(y_true[:, s], y_pred[:, s], multioutput="variance_weighted")
+            for g, s in TGT_GROUPS.items()}
 
 
 def find_deterministic_cols(X, y, Xv, yv, thresh=0.99):
@@ -119,7 +139,8 @@ def build_models(rf_trees, seed):
 
 
 def row(name, m):
-    return f"{name:<24} MAE={m[0]:.4f}  RMSE={m[1]:.4f}  R2={m[2]:.4f}"
+    return (f"{name:<26} MAE={m[0]:.4f}  RMSE={m[1]:.4f}  "
+            f"R2unif={m[2]:+.3f}  R2varw={m[3]:+.3f}")
 
 
 def main():
@@ -148,17 +169,26 @@ def main():
     print("[A] model comparison (base 124 features)")
     print("     scores shown ALL columns, then EXCLUDING near-deterministic ones")
     models = build_models(args.rf_trees, args.seed)
-    fitted = {}
+    preds = {}
     for name, model in models.items():
         model.fit(X, y)
-        fitted[name] = model
         pv = model.predict(Xv)
+        preds[name] = pv
         print("  " + row(name + " [all]", metrics(yv, pv)))
         if len(keep):
             print("  " + row(name + " [excl.det]", metrics(yv, pv, cols=keep)))
     if not len(keep):
         print("  (every column was near-deterministic at this threshold; "
               "raise --det-thresh to separate them)")
+    print()
+
+    # per-target-group variance-weighted R2 (where does each model do well?)
+    print("    variance-weighted R2 by target group:")
+    hdr = "      " + " " * 18 + "".join(f"{g:>22}" for g in TGT_GROUPS)
+    print(hdr)
+    for name, pv in preds.items():
+        gr = group_r2(yv, pv)
+        print(f"      {name:<18}" + "".join(f"{gr[g]:>22.3f}" for g in TGT_GROUPS))
     print()
 
     # --- (C) does the RH-inspired feature help? -----------------------------
@@ -170,8 +200,9 @@ def main():
         rh = build_models(args.rf_trees, args.seed)[name].fit(Xr, y)
         b = metrics(yv, base.predict(Xv), cols=eval_cols)
         r = metrics(yv, rh.predict(Xvr), cols=eval_cols)
-        print(f"  {name:<18} base  R2={b[2]:.4f}   +RH  R2={r[2]:.4f}   "
-              f"delta={r[2]-b[2]:+.4f}   (excl. near-deterministic cols)")
+        # index 3 = variance-weighted R2 (the meaningful aggregate)
+        print(f"  {name:<18} base  R2varw={b[3]:+.4f}   +RH  R2varw={r[3]:+.4f}   "
+              f"delta={r[3]-b[3]:+.4f}   (excl. near-deterministic cols)")
 
     print("\nTakeaway to check against your write-up:")
     print("  - swapping models moves R2 less than adding/removing feature groups")
