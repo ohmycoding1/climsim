@@ -1,0 +1,7 @@
+# Downloaded dataset artifacts — do not commit (multi-GB)
+data/
+*.npy
+*.parquet
+.cache/
+__pycache__/
+*.pyc
